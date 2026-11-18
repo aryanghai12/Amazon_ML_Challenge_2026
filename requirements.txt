@@ -6,7 +6,7 @@ pyyaml
 pytest
 jupyter
 pyarrow
-lightgbm
+lightgbm==4.6.0  # last Windows wheel built with the OpenCL GPU learner (4.7.0 is CPU-only)
 anyascii
 tqdm
 unidecode

@@ -141,3 +141,132 @@ class CandidateGenerator:
         df = df.sort_values(["s1_row", "pre_score"], ascending=[True, False], kind="stable")
         df = df[df.groupby("s1_row", sort=False).cumcount() < self.top_k]
         return df.reset_index(drop=True)
+
+
+# ============================================================================ v2
+class SimCandidateGenerator:
+    """Blocking v2 (see docs/EXPERIMENTS_V2.md).
+
+    Stage 1 - union of all key blocks. `keys` maps key name -> max block size; the
+              cap is applied when loading, so one index built with a generous cap
+              (index_v2, 3000) serves every setting. Per pair we keep n_keys, a bit
+              mask of the keys that fired and an IDF weight sum(1/log2(1+block)).
+    Stage 2 - NO shared-key-count cap (v1's pre_k lost 5.4% of true pairs): every
+              stage-1 pair gets the cheap name/address token-set similarity and the
+              best `top_k` per S1 are kept (a per-S1 safety cap `max_stage1` by IDF
+              weight bounds the cost of pathological S1 records).
+    """
+
+    def __init__(self, processed, split, keys: dict, top_k=60, index_name="index_v2", max_stage1=4000,
+                 records: Records | None = None, ranker=None):
+        t0 = time.time()
+        self.keys = list(keys)
+        self.split = split
+        self.top_k, self.max_stage1 = top_k, max_stage1
+        self.ranker = ranker
+        idx = os.path.join(processed, split, index_name)
+        self.others, self.s1 = {}, {}
+        for name, cap in keys.items():
+            o = pq.read_table(os.path.join(idx, f"{name}__others.parquet"))
+            ok = o.column("key").to_numpy()
+            _, counts = np.unique(ok, return_counts=True)       # ok is sorted by key
+            keep = np.repeat(counts <= cap, counts)
+            # 12 bytes per row (uint64 key + int32 candidate); the IDF weight is recomputed from
+            # the block size at query time instead of being stored per row
+            cand = encode(o.column("src").to_numpy()[keep], o.column("row").to_numpy()[keep]).astype(np.int32)
+            ok = ok[keep]
+            del o, keep, counts
+            self.others[name] = (ok, cand)
+            s = pd.read_parquet(os.path.join(idx, f"{name}__s1.parquet"))
+            s = s[np.isin(s["key"].to_numpy(np.uint64), ok)].sort_values("row", kind="stable")
+            self.s1[name] = (s["row"].to_numpy(np.int32), s["key"].to_numpy(np.uint64))
+            del s
+        self.records = records or Records(processed, split)
+        self._cache = {}
+        print(f"  v2 blocking indexes loaded for {split} ({len(self.keys)} keys) in {time.time() - t0:.0f}s",
+              flush=True)
+
+    # ------------------------------------------------------------------ string cache
+    def strings(self, src, col):
+        if (src, col) not in self._cache:
+            self._cache[(src, col)] = np.asarray(self.records.tables[src].column(col).to_pylist(), dtype=object)
+        return self._cache[(src, col)]
+
+    def cand_strings(self, cand, col):
+        src, row = decode(cand)
+        out = np.empty(len(cand), dtype=object)
+        for k in (2, 3):
+            m = src == k
+            out[m] = self.strings(k, col)[row[m]]
+        return out
+
+    # ------------------------------------------------------------------ stage 1
+    def key_candidates(self, s1_rows) -> pd.DataFrame:
+        s1_rows = np.unique(np.asarray(s1_rows, dtype=np.int64))
+        lo_row, hi_row = s1_rows.min(), s1_rows.max()
+        wanted = pd.Index(s1_rows)
+        codes, bits, ws = [], [], []
+        for ki, name in enumerate(self.keys):
+            rows, keys = self.s1[name]
+            a, b = np.searchsorted(rows, [lo_row, hi_row + 1])
+            r, k = rows[a:b], keys[a:b]
+            m = wanted.get_indexer(r) >= 0
+            r, k = r[m], k[m]
+            order = np.argsort(k, kind="stable")
+            r, k = r[order], k[order]
+            okeys, ocands = self.others[name]
+            lo = np.searchsorted(okeys, k, side="left")
+            n = np.searchsorted(okeys, k, side="right") - lo
+            keep = n > 0
+            lo, n, r = lo[keep], n[keep], r[keep].astype(np.int64)
+            total = int(n.sum())
+            if total == 0:
+                continue
+            idx = np.repeat(lo - np.concatenate(([0], np.cumsum(n)[:-1])), n) + np.arange(total)
+            codes.append((np.repeat(r, n) << PAIR_SHIFT) | ocands[idx].astype(np.int64))
+            ws.append(np.repeat((1.0 / np.log2(1.0 + n)).astype(np.float32), n))
+            bits.append(np.full(total, 1 << ki, dtype=np.int32))
+        if not codes:
+            return pd.DataFrame({c: np.empty(0, t) for c, t in
+                                 (("s1_row", np.int64), ("cand", np.int64), ("n_keys", np.int16),
+                                  ("idf", np.float32), ("kbits", np.int32))})
+        codes = np.concatenate(codes)
+        order = np.argsort(codes, kind="stable")
+        codes = codes[order]
+        start = np.flatnonzero(np.concatenate(([True], codes[1:] != codes[:-1])))
+        uc = codes[start]
+        bits = np.bitwise_or.reduceat(np.concatenate(bits)[order], start)
+        w = np.add.reduceat(np.concatenate(ws)[order], start)
+        nk = np.diff(np.append(start, len(codes))).astype(np.int16)
+        df = pd.DataFrame({"s1_row": uc >> PAIR_SHIFT, "cand": uc & ((1 << PAIR_SHIFT) - 1),
+                           "n_keys": nk, "idf": w.astype(np.float32), "kbits": bits})
+        if self.max_stage1:
+            size = df.groupby("s1_row", sort=False)["cand"].transform("size").to_numpy()
+            if (size > self.max_stage1).any():
+                df = df.sort_values(["s1_row", "idf"], ascending=[True, False], kind="stable")
+                df = df[df.groupby("s1_row", sort=False).cumcount() < self.max_stage1]
+        return df.reset_index(drop=True)
+
+    # ------------------------------------------------------------------ stage 2
+    def cheap_features(self, df) -> pd.DataFrame:
+        from src.features.pair_features import fast_similarity
+        s1n = self.strings(1, "name_core")[df["s1_row"].to_numpy()]
+        s1a = self.strings(1, "addr_core")[df["s1_row"].to_numpy()]
+        c = df["cand"].to_numpy()
+        name_s, addr_s = fast_similarity(s1n, self.cand_strings(c, "name_core"), s1a, self.cand_strings(c, "addr_core"))
+        df["name_s"], df["addr_s"] = name_s, addr_s
+        df["pre_score"] = (np.maximum(name_s, addr_s) + 0.5 * np.minimum(name_s, addr_s)
+                           + 0.15 * np.minimum(df["n_keys"].to_numpy(), 4)).astype(np.float32)
+        return df
+
+    def generate(self, s1_rows) -> pd.DataFrame:
+        df = self.key_candidates(s1_rows)
+        if df.empty:
+            df["pre_score"] = np.empty(0, np.float32)
+            return df
+        df = self.cheap_features(df)
+        if self.ranker is not None:
+            df["pre_score"] = self.ranker.score(df).astype(np.float32)
+        df = df.sort_values(["s1_row", "pre_score"], ascending=[True, False], kind="stable")
+        df = df[df.groupby("s1_row", sort=False).cumcount() < self.top_k]
+        return df.reset_index(drop=True)

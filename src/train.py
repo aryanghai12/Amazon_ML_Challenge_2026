@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
@@ -27,12 +28,12 @@ import time
 import numpy as np
 import pandas as pd
 
-from src.blocking.candidates import CandidateGenerator
 from src.config import load_config
 from src.evaluation.metrics import blocking_report, evaluate
 from src.matching.aggregation import decide_pairs, tune_decision
 from src.matching.model import LGBMMatcher
-from src.scoring import build_pairs, chunks
+from src.scoring import (build_pairs, chunks, diff_for_meta, fit_stage_ranker, make_diff, make_generator,
+                         make_rarity, true_codes)
 
 
 def true_pairs_from_gt(processed) -> pd.DataFrame:
@@ -43,12 +44,12 @@ def true_pairs_from_gt(processed) -> pd.DataFrame:
     return long[long["other_id"] != ""].reset_index(drop=True)
 
 
-def collect(gen, rows, s1_chunk, true_pairs, label=True, tag=""):
+def collect(gen, rows, s1_chunk, true_pairs, label=True, tag="", diff=None):
     metas, Xs = [], []
     t0 = time.time()
     done = 0
     for part in chunks(rows, s1_chunk):
-        meta, X = build_pairs(gen, part)
+        meta, X = build_pairs(gen, part, diff)
         done += len(part)
         if X is not None:
             metas.append(meta)
@@ -104,6 +105,10 @@ def main():
     ap.add_argument("--n-train", type=int, default=None)
     ap.add_argument("--n-valid", type=int, default=None)
     ap.add_argument("--exp-id", default=None)
+    ap.add_argument("--fit-subsample", type=float, default=None,
+                    help="train the matcher on this random fraction of the fit S1 (learning-curve runs)")
+    ap.add_argument("--use-cache", action="store_true",
+                    help="reuse cached candidates/features of an identical blocking config")
     a = ap.parse_args()
 
     cfg = load_config(a.config)
@@ -116,7 +121,7 @@ def main():
     t_all = time.time()
 
     print("loading train records + blocking indexes ...", flush=True)
-    gen = CandidateGenerator(P["processed_dir"], "train", B["keys"], B["pre_k"], B["top_k"])
+    gen = make_generator(P, B, "train")
     s1_ids = gen.records.s1_ids()
     n_other = gen.records.n[2] + gen.records.n[3]
     true_pairs = true_pairs_from_gt(P["processed_dir"])
@@ -128,16 +133,112 @@ def main():
     rows_es = perm[n_train:n_train + n_es]
     rows_val = perm[n_train + n_es:n_train + n_es + n_valid]
 
-    meta_fit, X_fit = collect(gen, rows_fit, B["s1_chunk"], true_pairs, tag="fit")
-    meta_es, X_es = collect(gen, rows_es, B["s1_chunk"], true_pairs, tag="early-stop")
-    meta_val, X_val = collect(gen, rows_val, B["s1_chunk"], true_pairs, tag="valid")
+    # candidates + features depend only on the blocking config and the split: cache them so
+    # matcher / decision experiments do not repeat the (expensive) candidate generation
+    key = hashlib.md5(json.dumps({"B": B, "n": [len(rows_fit), len(rows_es), len(rows_val)],
+                                  "seed": T["seed"]}, sort_keys=True).encode()).hexdigest()[:10]
+    cache = os.path.join("experiments", "cache", key)
+    diff = make_diff(P, cfg.get("features"), "train")
+    if a.use_cache and os.path.exists(os.path.join(cache, "val.parquet")):
+        print(f"using cached candidates/features {cache}", flush=True)
+        sets = {}
+        for tag in ("fit", "es", "val"):
+            d = pd.read_parquet(os.path.join(cache, f"{tag}.parquet"))
+            sets[tag] = (d[["s1_row", "cand", "s1_id", "other_id", "_y"]], d.drop(columns=["s1_row", "cand",
+                                                                                        "s1_id", "other_id", "_y"]))
+        (meta_fit, X_fit), (meta_es, X_es), (meta_val, X_val) = sets["fit"], sets["es"], sets["val"]
+        if B.get("version", 1) == 2:
+            from src.blocking.ranker import StageRanker
+            StageRanker.load(cache).save(P["models_dir"])
+        if diff is not None:                     # extend the cache with the v2 diff features
+            for tag, (m, X) in list(sets.items()):
+                dp = os.path.join(cache, f"{tag}_diff.parquet")
+                if not os.path.exists(dp):
+                    diff_for_meta(gen, m, diff).to_parquet(dp, index=False)
+                dd = pd.read_parquet(dp)
+                sets[tag] = (m, pd.concat([X.reset_index(drop=True), dd], axis=1))
+            (meta_fit, X_fit), (meta_es, X_es), (meta_val, X_val) = sets["fit"], sets["es"], sets["val"]
+    else:
+        if B.get("version", 1) == 2:
+            # stage-2 ranker: fitted on fit S1 only (never on early-stop / validation S1)
+            codes = true_codes(gen, true_pairs)
+            n_rank = B.get("ranker_s1", 10000)
+            gen.ranker = fit_stage_ranker(gen, rows_fit[:n_rank], codes, B.get("stage1_chunk", 5000))
+            gen.ranker.save(P["models_dir"])
+            gen.ranker.save(cache)
+            del codes
+        meta_fit, X_fit = collect(gen, rows_fit, B["s1_chunk"], true_pairs, tag="fit", diff=diff)
+        meta_es, X_es = collect(gen, rows_es, B["s1_chunk"], true_pairs, tag="early-stop", diff=diff)
+        meta_val, X_val = collect(gen, rows_val, B["s1_chunk"], true_pairs, tag="valid", diff=diff)
+        os.makedirs(cache, exist_ok=True)
+        from src.features.diff_features import DIFF_NAMES
+        for tag, (m, X) in (("fit", (meta_fit, X_fit)), ("es", (meta_es, X_es)), ("val", (meta_val, X_val))):
+            dcols = [c for c in X.columns if c in DIFF_NAMES]
+            pd.concat([m.reset_index(drop=True), X.drop(columns=dcols).reset_index(drop=True)], axis=1).to_parquet(
+                os.path.join(cache, f"{tag}.parquet"), index=False)
+            if dcols:
+                X[dcols].reset_index(drop=True).to_parquet(os.path.join(cache, f"{tag}_diff.parquet"), index=False)
+
+    rarity = make_rarity(P, B, cfg.get("features"), gen)
+    if rarity is not None:                       # cheap per-record lookups: appended, never cached
+        for m, X in ((meta_fit, X_fit), (meta_es, X_es), (meta_val, X_val)):
+            for k, v in rarity.features(m["s1_row"].to_numpy(), m["cand"].to_numpy()).items():
+                X[k] = v
+        del rarity
+
+    if (cfg.get("features") or {}).get("brand"):
+        # pseudo-brand scorer: learned from FIT-S1 true pairs whose names share nothing (never valid labels)
+        from src.features.brand import BrandFeatures, BrandScorer
+        rb = meta_fit[(meta_fit["_y"].to_numpy() == 1) & (X_fit["name_tset"].to_numpy() < 0.3)
+                      & (X_fit["compact_partial"].to_numpy() < 0.5)]
+        tabs = gen.records.tables
+        bnames = gen.records.take_cand(rb["cand"].to_numpy(), ["name_compact"])["name_compact"]
+        bg = [s for k in (2, 3) for s in tabs[k].column("name_compact").to_pylist()[::20]]
+        scorer = BrandScorer.fit(bnames, bg)
+        os.makedirs(P["models_dir"], exist_ok=True)
+        scorer.save(P["models_dir"])
+        bf = BrandFeatures(scorer, gen.records)
+        for m, X in ((meta_fit, X_fit), (meta_es, X_es), (meta_val, X_val)):
+            for k, v in bf.features(m["s1_row"].to_numpy(), m["cand"].to_numpy()).items():
+                X[k] = v
+        print(f"  brand scorer fitted on {len(rb):,} replaced-name fit pairs", flush=True)
+        del bf, bg
+
+    if (cfg.get("features") or {}).get("competition"):
+        # competing same-name S1 entities (inputs only): does another reference entity fit the record better?
+        from src.features.competition import Competition
+        comp = Competition(P["processed_dir"], "train", gen.records, B.get("index_name", "index_v2"))
+        for m, X in ((meta_fit, X_fit), (meta_es, X_es), (meta_val, X_val)):
+            for k, v in comp.features(m["s1_row"].to_numpy(), m["cand"].to_numpy()).items():
+                X[k] = v
+        del comp
+    for spec in (cfg.get("features") or {}).get("competition_v2", []) or []:
+        from src.features.competition import CompetitionV2
+        comp = CompetitionV2(P["processed_dir"], "train", gen.records, spec["key"], spec["prefix"],
+                             B.get("index_name", "index_v2"), cap=spec.get("cap", 48))
+        for m, X in ((meta_fit, X_fit), (meta_es, X_es), (meta_val, X_val)):
+            # chunked: a record can have ~15 address keys, i.e. ~100 competitor comparisons
+            parts = [comp.features(m["s1_row"].to_numpy()[i:i + 200_000], m["cand"].to_numpy()[i:i + 200_000])
+                     for i in range(0, len(m), 200_000)]
+            for k in parts[0]:
+                X[k] = np.concatenate([p_[k] for p_ in parts])
+        print(f"  competition features over {spec['key']} added", flush=True)
+        del comp
 
     val_ids = s1_ids[np.sort(rows_val)]
     blk = blocking_report(meta_val, true_pairs, val_ids, n_other)
     print("blocking (valid):", json.dumps(blk), flush=True)
 
     M = cfg["model"]
-    model = LGBMMatcher(M["params"], M["num_boost_round"], M["early_stopping_rounds"])
+    if a.fit_subsample:
+        keep_rows = np.random.default_rng(123).permutation(np.unique(meta_fit["s1_row"].to_numpy()))
+        keep_rows = keep_rows[:int(len(keep_rows) * a.fit_subsample)]
+        m = np.isin(meta_fit["s1_row"].to_numpy(), keep_rows)
+        meta_fit, X_fit = meta_fit[m].reset_index(drop=True), X_fit[m].reset_index(drop=True)
+        print(f"  fit subsample {a.fit_subsample}: {len(keep_rows):,} S1, {len(X_fit):,} pairs", flush=True)
+    X_fit = X_fit[X_val.columns]                 # identical column order everywhere
+    X_es = X_es[X_val.columns]
+    model = LGBMMatcher(M["params"], M["num_boost_round"], M["early_stopping_rounds"], M.get("gpu_vendor"))
     print(f"training LightGBM on {len(X_fit):,} pairs ({int(meta_fit._y.sum()):,} positive) ...", flush=True)
     model.fit(X_fit, meta_fit["_y"], X_es, meta_es["_y"])
 
@@ -203,7 +304,7 @@ def main():
           f"- Date: {report['date']}  |  commit: `{report['git_commit']}`  |  runtime: {runtime / 60:.1f} min",
           f"- Train S1 used to fit: {len(rows_fit):,} ({len(X_fit):,} candidate pairs, "
           f"{int(meta_fit._y.sum()):,} positive); early-stop S1: {len(rows_es):,}; validation S1: {len(rows_val):,}",
-          f"- Blocking keys: {B['keys']}; pre_k={B['pre_k']}, top_k={B['top_k']}", "",
+          f"- Blocking keys: {B['keys']}; pre_k={B.get('pre_k')}, top_k={B['top_k']}", "",
           "## Blocking (validation S1)", "", "| metric | value |", "|---|---|"]
     md += [f"| {k} | {v} |" for k, v in blk.items()]
     md += ["", "## Matching (validation S1, best decision)", "",
@@ -222,6 +323,7 @@ def main():
     with open(os.path.join(res_dir, "report.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(md) + "\n")
 
+    meta_val[["s1_id", "other_id", "p", "_y"]].to_parquet(os.path.join(res_dir, "valid_scored.parquet"), index=False)
     reg = os.path.join("experiments", "experiment_registry.csv")
     if os.path.exists(reg):
         with open(reg, "a", newline="", encoding="utf-8") as f:

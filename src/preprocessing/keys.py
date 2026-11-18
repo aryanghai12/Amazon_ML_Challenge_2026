@@ -51,6 +51,33 @@ def k_state_name_skel(r):        # state + first name skeleton word
     return [r.addr_state + "|" + t[0]] if (t and r.addr_state) else []
 
 
+def k_name_compact(r):           # the whole compact name ('visionphysicians.com' == 'Vision Physicians')
+    return [r.name_compact] if len(r.name_compact) >= 4 else []
+
+
+def k_name_prefix8(r):           # longer prefix: stays below the block cap where prefix5 is oversized
+    return [r.name_compact[:8]] if len(r.name_compact) >= 6 else []
+
+
+def _addr_words(r, n):
+    return [t for t in r.addr_key.split() if len(t) >= 2][:n]
+
+
+def k_addr_pair(r):              # order-free pairs of address words (name replaced / native script)
+    t = sorted(set(_addr_words(r, 6)))
+    return [a + "_" + b for i, a in enumerate(t) for b in t[i + 1:]]
+
+
+def k_name_addr(r):              # each of the first two name words x each address word
+    names = [t for t in r.name_key.split() if len(t) >= 2][:2]
+    return [n + "|" + a for n in names for a in _addr_words(r, 6)]
+
+
+def k_num_street1(r):            # like num_street but also 1-digit house numbers
+    nums = r.addr_nums.split()[:3]
+    return [n + "|" + w for n in nums for w in _addr_words(r, 6)]
+
+
 KEYS = {
     "name_tokens": k_name_tokens,
     "name_first": k_name_first,
@@ -60,6 +87,11 @@ KEYS = {
     "addr_tokens": k_addr_tokens,
     "num_street": k_num_street,
     "state_name_skel": k_state_name_skel,
+    "name_compact": k_name_compact,
+    "name_prefix8": k_name_prefix8,
+    "addr_pair": k_addr_pair,
+    "name_addr": k_name_addr,
+    "num_street1": k_num_street1,
 }
 
 # columns each key needs (plus entity_id + country, always read)
@@ -72,6 +104,11 @@ KEY_COLUMNS = {
     "addr_tokens": ["addr_key"],
     "num_street": ["addr_nums", "addr_key"],
     "state_name_skel": ["addr_state", "name_key"],
+    "name_compact": ["name_compact"],
+    "name_prefix8": ["name_compact"],
+    "addr_pair": ["addr_key"],
+    "name_addr": ["name_key", "addr_key"],
+    "num_street1": ["addr_nums", "addr_key"],
 }
 
 

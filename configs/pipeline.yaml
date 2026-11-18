@@ -2,14 +2,14 @@
 # Every value here is recorded in the experiment report, so change values here, not in code.
 
 paths:
-  dataset_dir: C:\Users\kusha\Downloads\6ab10eb3b23ba_student_resource\student_resource\dataset
+  dataset_dir: C:\Users\aryan\Videos\6ab10eb3b23ba_student_resource\student_resource\dataset
   # already produced on this laptop by src.preprocessing.preprocess (24.2M rows); on another machine
   # either copy that folder here or re-run preprocess and point this at data/processed
-  processed_dir: C:\Users\kusha\Downloads\6ab10eb3b23ba_student_resource\student_resource\processed
+  processed_dir: data/processed
   models_dir: models
   output_dir: output
   results_dir: experiments/results
-  validator: C:\Users\kusha\Downloads\6ab10eb3b23ba_student_resource\student_resource\utils\validate_submission.py
+  validator: C:\Users\aryan\Videos\6ab10eb3b23ba_student_resource\student_resource\utils\validate_submission.py
 
 blocking:
   # key -> max block size over S2+S3 (larger key values are dropped as oversized)
@@ -22,7 +22,7 @@ blocking:
     addr_tokens: 200
   pre_k: 100          # candidates kept per S1 after counting shared keys
   top_k: 40           # candidates kept per S1 after the cheap similarity re-rank (= candidate_pairs.tsv)
-  s1_chunk: 50000     # S1 records processed per chunk (memory bound)
+  s1_chunk: 20000     # S1 records processed per chunk (memory bound; 50000 ran out of memory in predict on a 24 GB laptop)
 
 train:
   n_train_s1: 150000  # S1 train entities used to fit the model
@@ -33,6 +33,9 @@ model:
   type: lightgbm      # MIT licence
   num_boost_round: 600
   early_stopping_rounds: 40
+  # OpenCL device picked by vendor name (BOOST_COMPUTE_DEFAULT_VENDOR): on a hybrid Intel+NVIDIA
+  # laptop LightGBM's platform ids are not stable and platform 0 can be the Intel iGPU
+  gpu_vendor: NVIDIA
   params:
     objective: binary
     learning_rate: 0.08
@@ -44,6 +47,11 @@ model:
     lambda_l2: 1.0
     verbose: -1
     num_threads: 0
+    # OpenCL GPU tree learner (training only; predict stays on CPU). Needs a GPU-enabled build:
+    # the lightgbm 4.6.0 Windows wheel has it, 4.7.0 does not. Set to cpu on machines without a GPU.
+    device_type: gpu
+    gpu_platform_id: -1   # -1 = choose by model.gpu_vendor above
+    gpu_device_id: -1
 
 decision:
   min_keep_prob: 0.02            # scored pairs below this are never stored

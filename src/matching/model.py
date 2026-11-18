@@ -14,15 +14,23 @@ import pandas as pd
 
 
 class LGBMMatcher:
-    def __init__(self, params: dict | None = None, num_boost_round=600, early_stopping_rounds=40):
+    def __init__(self, params: dict | None = None, num_boost_round=600, early_stopping_rounds=40,
+                 gpu_vendor: str | None = None):
         self.params = dict(params or {"objective": "binary", "verbose": -1})
         self.num_boost_round = num_boost_round
         self.early_stopping_rounds = early_stopping_rounds
+        self.gpu_vendor = gpu_vendor
         self.booster = None
         self.features: list[str] = []
 
     def fit(self, X: pd.DataFrame, y, X_valid=None, y_valid=None):
         import lightgbm as lgb
+        device = self.params.get("device_type", "cpu")
+        if device == "gpu" and self.gpu_vendor:
+            # Boost.Compute (LightGBM's OpenCL layer) picks this vendor when gpu_platform_id/gpu_device_id = -1
+            os.environ.setdefault("BOOST_COMPUTE_DEFAULT_VENDOR", self.gpu_vendor)
+        print(f"LightGBM {lgb.__version__} device_type={device} "
+              f"vendor={os.environ.get('BOOST_COMPUTE_DEFAULT_VENDOR', '-') if device == 'gpu' else '-'}", flush=True)
         self.features = list(X.columns)
         dtrain = lgb.Dataset(X, label=np.asarray(y), free_raw_data=True)
         valid_sets, callbacks = [dtrain], [lgb.log_evaluation(50)]

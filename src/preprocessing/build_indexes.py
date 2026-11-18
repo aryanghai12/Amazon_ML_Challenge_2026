@@ -65,7 +65,7 @@ def _read(processed, split, k, cols):
                            columns=["entity_id", "country"] + cols)
 
 
-def build(processed, splits=("train", "test"), keys=None, max_block=1000, workers=None):
+def build(processed, splits=("train", "test"), keys=None, max_block=1000, workers=None, index_name="index"):
     """keys: list of key names (all use max_block) or dict name -> max_block."""
     keys = keys or list(KEYS)
     limits = dict(keys) if isinstance(keys, dict) else {k: max_block for k in keys}
@@ -76,7 +76,7 @@ def build(processed, splits=("train", "test"), keys=None, max_block=1000, worker
         if not os.path.exists(os.path.join(processed, split, "source1.parquet")):
             print("missing split, skipped:", split)
             continue
-        out_dir = os.path.join(processed, split, "index")
+        out_dir = os.path.join(processed, split, index_name)
         os.makedirs(out_dir, exist_ok=True)
         stats[split] = {}
         for name in keys:
@@ -111,8 +111,10 @@ def build(processed, splits=("train", "test"), keys=None, max_block=1000, worker
             print(f"  {split}/{name}: {st['others_rows']:,} S2/S3 key rows, {st['s1_rows']:,} S1 key rows, "
                   f"{st['oversized_keys']:,} oversized keys dropped ({st['seconds']}s)", flush=True)
             del others, s1
-        with open(os.path.join(out_dir, "stats.json"), "w") as f:
-            json.dump(stats[split], f, indent=1)
+        sp = os.path.join(out_dir, "stats.json")
+        old = json.load(open(sp)) if os.path.exists(sp) else {}
+        with open(sp, "w") as f:
+            json.dump({**old, **stats[split]}, f, indent=1)
     return stats
 
 
@@ -152,6 +154,7 @@ def main():
     ap.add_argument("--keys", default="all", help="comma list from keys.KEYS or 'all'")
     ap.add_argument("--max-block", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--index-name", default="index", help="sub-folder of <split>/ to write to")
     ap.add_argument("--config", default=None,
                     help="YAML with blocking.keys {name: max_block}; overrides --keys/--max-block")
     a = ap.parse_args()
@@ -166,7 +169,7 @@ def main():
     if unknown:
         ap.error(f"unknown keys {unknown}; choose from {list(KEYS)}")
     t0 = time.time()
-    build(a.processed, tuple(a.splits.split(",")), keys, a.max_block, a.workers)
+    build(a.processed, tuple(a.splits.split(",")), keys, a.max_block, a.workers, a.index_name)
     print(f"done in {time.time() - t0:.0f}s")
 
 

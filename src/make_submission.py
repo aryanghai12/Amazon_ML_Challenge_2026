@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--relative", type=float, default=None)
     ap.add_argument("--no-validator", action="store_true")
+    ap.add_argument("--no-stacker", action="store_true", help="use the matcher scores directly")
     a = ap.parse_args()
     cfg = load_config(a.config)
     P = cfg["paths"]
@@ -49,7 +50,18 @@ def main():
           f"(validation macro F0.5 = {v['valid_macro_f05']})")
 
     scored = pd.read_parquet(SCORED_PATH)
-    kept = decide_pairs(scored, v["threshold"], v["relative"], decision["one_to_one"])
+    st = decision.get("stacker")
+    if st and not a.no_stacker:
+        # entity-aware second stage (src/fit_stacker.py): re-score, then its own cross-fitted rule
+        import lightgbm as lgb
+        from src.matching.stacker import stack_features
+        booster = lgb.Booster(model_file=os.path.join(P["models_dir"], "stacker.txt"))
+        scored = scored.assign(p=booster.predict(stack_features(scored)[st["features"]]))
+        if a.threshold is None:
+            v = {"name": "stacker", "threshold": st["threshold"], "relative": st["relative"],
+                 "valid_macro_f05": st["valid_macro_f05_cross_fitted"]}
+        print(f"stacker applied: threshold={v['threshold']} relative={v['relative']}")
+    kept = decide_pairs(scored[["s1_id", "other_id", "p"]], v["threshold"], v["relative"], decision["one_to_one"])
     s1_ids = pd.read_parquet(os.path.join(P["processed_dir"], "test", "source1.parquet"),
                              columns=["entity_id"])["entity_id"].tolist()
     lists = pairs_to_lists(kept, s1_ids)
