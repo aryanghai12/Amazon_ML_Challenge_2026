@@ -1,0 +1,82 @@
+# End-to-end pipeline configuration (src/train.py, src/predict.py, src/make_submission.py).
+# Every value here is recorded in the experiment report, so change values here, not in code.
+
+paths:
+  dataset_dir: C:\Users\aryan\Videos\6ab10eb3b23ba_student_resource\student_resource\dataset
+  # already produced on this laptop by src.preprocessing.preprocess (24.2M rows); on another machine
+  # either copy that folder here or re-run preprocess and point this at data/processed
+  processed_dir: data/processed
+  models_dir: models/v7
+  output_dir: output
+  results_dir: experiments/results
+  validator: C:\Users\aryan\Videos\6ab10eb3b23ba_student_resource\student_resource\utils\validate_submission.py
+
+blocking:
+  # v2 (docs/EXPERIMENTS_V2.md): union of 11 keys (caps applied at load time from index_v2, built
+  # with --max-block 3000) -> learned stage-2 ranker on EVERY stage-1 pair -> top_k per S1.
+  # v1's shared-key-count pre-cap (pre_k) lost 5.4% of the true pairs and is gone.
+  version: 2
+  index_name: index_v2
+  keys:
+    name_skel_pair: 1000
+    name_first: 1000
+    name_prefix5: 1000
+    num_street: 1000
+    state_name_skel: 1000
+    addr_tokens: 1000
+    name_compact: 1000
+    name_prefix8: 1000
+    addr_pair: 1000
+    name_addr: 1000
+    num_street1: 1000
+  max_stage1: 4000    # per-S1 safety cap on stage-1 pairs (by IDF weight) before the ranker
+  top_k: 40           # candidates kept per S1 after the ranker (= candidate_pairs.tsv)
+  ranker_s1: 10000    # fit S1 used to train the stage-2 ranker
+  stage1_chunk: 5000
+  s1_chunk: 5000      # S1 per chunk (stage-1 is ~2.4k pairs per S1)
+
+features:
+  # pair_features v2: token-level difference features (src/features/diff_features.py) that tell a
+  # deliberate change (distractor) from corruption noise (true match)
+  diff: true
+  # rarity: how many S2/S3 records share the record's rarest key of each type (src/features/rarity.py)
+  rarity: true
+  # s1dup: how many S1 records share the key (for the candidate: how many reference entities compete for it)
+  s1dup: true
+  # brand: pseudo-brand likelihood of the name (src/features/brand.py), learned on fit S1 only
+  brand: true
+
+train:
+  n_train_s1: 150000  # S1 train entities used to fit the model
+  n_valid_s1: 60000   # disjoint S1 train entities used for threshold tuning and reporting
+  seed: 42
+
+model:
+  type: lightgbm      # MIT licence
+  num_boost_round: 3000   # 600 never early-stopped (E1-E4)
+  early_stopping_rounds: 100
+  # OpenCL device picked by vendor name (BOOST_COMPUTE_DEFAULT_VENDOR): on a hybrid Intel+NVIDIA
+  # laptop LightGBM's platform ids are not stable and platform 0 can be the Intel iGPU
+  gpu_vendor: NVIDIA
+  params:
+    objective: binary
+    learning_rate: 0.08
+    num_leaves: 63
+    min_data_in_leaf: 100
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 1.0
+    verbose: -1
+    num_threads: 0
+    # OpenCL GPU tree learner (training only; predict stays on CPU). Needs a GPU-enabled build:
+    # the lightgbm 4.6.0 Windows wheel has it, 4.7.0 does not. Set to cpu on machines without a GPU.
+    device_type: gpu
+    gpu_platform_id: -1   # -1 = choose by model.gpu_vendor above
+    gpu_device_id: -1
+
+decision:
+  min_keep_prob: 0.02            # scored pairs below this are never stored
+  one_to_one: true               # each S2/S3 record goes to at most one S1 (0 violations in train GT)
+  threshold_grid: [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.93, 0.95, 0.97]
+  relative_grid: [0.0, 0.3, 0.5, 0.7]   # keep p >= rel * best p of the same S1
